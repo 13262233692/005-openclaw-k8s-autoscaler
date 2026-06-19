@@ -42,6 +42,7 @@ openclaw_init() {
     _load_module "status" || return 1
     _load_module "restart" || return 1
     _load_module "hpa" || return 1
+    _load_module "drain" || return 1
 
     openclaw_parser_init
 

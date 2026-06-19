@@ -19,6 +19,7 @@ openclaw_parser_init() {
     openclaw_register_command "hpa" "openclaw_cmd_hpa" "HPA dynamic configuration management"
     openclaw_register_command "status" "openclaw_cmd_status" "Get cluster real-time metrics and status"
     openclaw_register_command "audit" "openclaw_cmd_audit" "View execution audit records"
+    openclaw_register_command "drain" "openclaw_cmd_drain" "Node scheduling intervention and workload evacuation"
 }
 
 openclaw_register_command() {
@@ -133,6 +134,9 @@ openclaw_cmd_help() {
                 ;;
             audit)
                 openclaw_help_audit
+                ;;
+            drain)
+                openclaw_help_drain
                 ;;
             *)
                 openclaw_log_error "Unknown help topic: $topic"
