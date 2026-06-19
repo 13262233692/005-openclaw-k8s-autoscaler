@@ -83,7 +83,12 @@ EOF
     local curl_cmd
 
     if command -v curl &>/dev/null; then
-        curl_cmd=(curl -s -o - -w "\n%{http_code}" -X POST \
+        local curl_body_file
+        curl_body_file=$(openclaw_tmpfile_create "curlbody")
+        local curl_code_file
+        curl_code_file=$(openclaw_tmpfile_create "curlcode")
+
+        curl_cmd=(curl -s -o "$curl_body_file" -w "%{http_code}" -X POST \
             -H "Content-Type: application/json" \
             -H "X-Trace-ID: ${trace_id}" \
             -H "X-Event-ID: ${event_id}" \
@@ -92,18 +97,24 @@ EOF
             -d "${payload}" \
             "${OPENCLAW_WEBHOOK_URL}")
 
-        response=$("${curl_cmd[@]}" 2>&1)
-        local curl_exit=$?
+        local curl_exit=1
+        if openclaw_exec_with_timeout $((OPENCLAW_WEBHOOK_TIMEOUT + 5)) "${curl_cmd[@]}" > "$curl_code_file" 2>&1; then
+            curl_exit=0
+        else
+            curl_exit=$?
+        fi
 
         if [[ $curl_exit -ne 0 ]]; then
-            openclaw_log_warn "Webhook request failed (curl exit: ${curl_exit}): ${response}"
+            local curl_err
+            curl_err=$(cat "$curl_code_file" 2>/dev/null || echo "unknown error")
+            openclaw_log_warn "Webhook request failed (curl exit: ${curl_exit}): ${curl_err}"
             OPENCLAW_WEBHOOK_FAILED_COUNT=$((OPENCLAW_WEBHOOK_FAILED_COUNT + 1))
             return 1
         fi
 
-        http_code=$(echo "$response" | tail -n 1)
-        local body
-        body=$(echo "$response" | sed '$d')
+        http_code=$(cat "$curl_code_file" 2>/dev/null || echo "0")
+        local body=""
+        [[ -s "$curl_body_file" ]] && body=$(cat "$curl_body_file")
 
         if [[ "$http_code" =~ ^2 ]]; then
             openclaw_log_debug "Webhook delivered successfully (HTTP ${http_code})"
@@ -116,40 +127,77 @@ EOF
             return 1
         fi
     elif command -v python3 &>/dev/null; then
-        local python_result
-        python_result=$(python3 -c "
+        local py_out_file
+        py_out_file=$(openclaw_tmpfile_create "webhookpy")
+        local py_script='
 import json, urllib.request, urllib.error, sys, socket
 
-url = '${OPENCLAW_WEBHOOK_URL}'
-data = '''${payload}'''.encode('utf-8')
+url = sys.argv[1]
+payload_file = sys.argv[2]
+trace_id = sys.argv[3]
+event_id = sys.argv[4]
+timeout = int(sys.argv[5])
 
-req = urllib.request.Request(url, data=data, method='POST')
-req.add_header('Content-Type', 'application/json')
-req.add_header('X-Trace-ID', '${trace_id}')
-req.add_header('X-Event-ID', '${event_id}')
+with open(payload_file, "r", encoding="utf-8") as f:
+    data = f.read().encode("utf-8")
+
+req = urllib.request.Request(url, data=data, method="POST")
+req.add_header("Content-Type", "application/json")
+req.add_header("X-Trace-ID", trace_id)
+req.add_header("X-Event-ID", event_id)
 
 try:
-    resp = urllib.request.urlopen(req, timeout=${OPENCLAW_WEBHOOK_TIMEOUT})
-    print(f'STATUS:{resp.status}')
-    print(resp.read().decode('utf-8')[:500])
+    resp = urllib.request.urlopen(req, timeout=timeout)
+    print(f"STATUS:{resp.status}")
+    print(resp.read().decode("utf-8")[:500])
     sys.exit(0)
 except urllib.error.HTTPError as e:
-    print(f'STATUS:{e.code}')
-    print(e.read().decode('utf-8')[:500])
+    print(f"STATUS:{e.code}")
+    print(e.read().decode("utf-8")[:500])
     sys.exit(1)
 except Exception as e:
-    print(f'ERROR:{str(e)}')
+    print(f"ERROR:{str(e)}")
     sys.exit(1)
-" 2>&1)
-        local py_exit=$?
+'
+        local py_script_file
+        py_script_file=$(openclaw_tmpfile_create "whscript.py")
+        printf '%s' "$py_script" > "$py_script_file"
+
+        local py_payload_file
+        py_payload_file=$(openclaw_tmpfile_create "whpayload")
+        printf '%s' "$payload" > "$py_payload_file"
+
+        local py_exit=1
+        if openclaw_exec_with_timeout $((OPENCLAW_WEBHOOK_TIMEOUT + 5)) \
+            python3 "$py_script_file" \
+            "$OPENCLAW_WEBHOOK_URL" \
+            "$py_payload_file" \
+            "$trace_id" \
+            "$event_id" \
+            "$OPENCLAW_WEBHOOK_TIMEOUT" \
+            >"$py_out_file" 2>&1; then
+            py_exit=0
+        else
+            py_exit=$?
+        fi
 
         if [[ $py_exit -eq 0 ]]; then
-            local status_line
-            status_line=$(echo "$python_result" | grep '^STATUS:' | head -1 | sed 's/STATUS://')
+            local status_line="?"
+            if [[ -s "$py_out_file" ]]; then
+                local raw_line
+                while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
+                    if [[ "$raw_line" == STATUS:* ]]; then
+                        status_line="${raw_line#STATUS:}"
+                        break
+                    fi
+                done < "$py_out_file"
+            fi
             openclaw_log_debug "Webhook delivered (HTTP ${status_line})"
             OPENCLAW_WEBHOOK_SUCCESS_COUNT=$((OPENCLAW_WEBHOOK_SUCCESS_COUNT + 1))
             return 0
         else
+            local python_result=""
+            [[ -s "$py_out_file" ]] && python_result=$(cat "$py_out_file")
             openclaw_log_warn "Webhook request failed: ${python_result}"
             OPENCLAW_WEBHOOK_FAILED_COUNT=$((OPENCLAW_WEBHOOK_FAILED_COUNT + 1))
             return 1

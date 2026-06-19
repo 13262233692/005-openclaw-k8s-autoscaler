@@ -86,36 +86,47 @@ openclaw_cmd_restart() {
 
     local deployments=()
 
+    local extract_names_script='
+import json, sys
+data = json.load(open(sys.argv[1]))
+for item in data.get("items", []):
+    print(item["metadata"]["name"])
+'
+
     if [[ "$target_all" == "true" ]]; then
         openclaw_log_info "Discovering all deployments in namespace: ${OPENCLAW_KUBECTL_NAMESPACE}"
-        local depl_json
-        depl_json=$(openclaw_api_get_deployments) || {
+        local depl_file
+        depl_file=$(openclaw_api_get_deployments_file) || {
             openclaw_log_error "Failed to get deployment list"
             return 1
         }
-        deployments=($(echo "$depl_json" | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-for item in data.get('items', []):
-    print(item['metadata']['name'])
-" 2>/dev/null))
+        local names_file
+        names_file=$(openclaw_tmpfile_create "deplnames")
+        if openclaw_process_json_script_file "$depl_file" "$extract_names_script" 60 > "$names_file" 2>/dev/null && [[ -s "$names_file" ]]; then
+            while IFS= read -r dname || [[ -n "$dname" ]]; do
+                [[ -z "$dname" ]] && continue
+                deployments+=("$dname")
+            done < "$names_file"
+        fi
         if [[ ${#deployments[@]} -eq 0 ]]; then
             openclaw_log_warn "No deployments found in namespace: ${OPENCLAW_KUBECTL_NAMESPACE}"
             return 0
         fi
     elif [[ -n "$target_selector" ]]; then
         openclaw_log_info "Discovering deployments with selector: ${target_selector}"
-        local depl_json
-        depl_json=$(openclaw_api_get_deployments "$target_selector") || {
+        local depl_file
+        depl_file=$(openclaw_api_get_deployments_file "$target_selector") || {
             openclaw_log_error "Failed to get deployment list by selector"
             return 1
         }
-        deployments=($(echo "$depl_json" | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-for item in data.get('items', []):
-    print(item['metadata']['name'])
-" 2>/dev/null))
+        local names_file
+        names_file=$(openclaw_tmpfile_create "deplnames")
+        if openclaw_process_json_script_file "$depl_file" "$extract_names_script" 60 > "$names_file" 2>/dev/null && [[ -s "$names_file" ]]; then
+            while IFS= read -r dname || [[ -n "$dname" ]]; do
+                [[ -z "$dname" ]] && continue
+                deployments+=("$dname")
+            done < "$names_file"
+        fi
         if [[ ${#deployments[@]} -eq 0 ]]; then
             openclaw_log_warn "No deployments found matching selector: ${target_selector}"
             return 0

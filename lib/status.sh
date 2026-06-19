@@ -2,6 +2,13 @@
 
 # Open Claw - Status Module
 # Get cluster real-time metrics and status
+#
+# NOTE: This module has been refactored to eliminate pipeline deadlocks.
+# Key changes:
+#   - All JSON parsing done via temp files, never echo | python3 pipes
+#   - Python processing scripts read from file, write to file
+#   - Every python3 call wrapped with timeout enforcement
+#   - Graceful fallback when JSON parsing fails (avoids hanging)
 
 OPENCLAW_STATUS_LOADED=1
 
@@ -86,12 +93,24 @@ openclaw_status_all() {
     local output_format="$1"
 
     if [[ "$output_format" == "json" ]]; then
-        local nodes_json pods_json deployments_json hpa_json
+        local nodes_file pods_file depls_file hpa_file
+        local nodes_json='{"items":[]}'
+        local pods_json='{"items":[]}'
+        local depls_json='{"items":[]}'
+        local hpa_json='{"items":[]}'
 
-        nodes_json=$(openclaw_api_get_nodes 2>/dev/null || echo '{"items":[]}')
-        pods_json=$(openclaw_api_get_pods 2>/dev/null || echo '{"items":[]}')
-        deployments_json=$(openclaw_api_get_deployments 2>/dev/null || echo '{"items":[]}')
-        hpa_json=$(openclaw_api_get_hpa_list 2>/dev/null || echo '{"items":[]}')
+        if nodes_file=$(openclaw_api_get_nodes_file 2>/dev/null) && [[ -f "$nodes_file" ]]; then
+            nodes_json=$(cat "$nodes_file")
+        fi
+        if pods_file=$(openclaw_api_get_pods_file 2>/dev/null) && [[ -f "$pods_file" ]]; then
+            pods_json=$(cat "$pods_file")
+        fi
+        if depls_file=$(openclaw_api_get_deployments_file 2>/dev/null) && [[ -f "$depls_file" ]]; then
+            depls_json=$(cat "$depls_file")
+        fi
+        if hpa_file=$(openclaw_api_get_hpa_list_file 2>/dev/null) && [[ -f "$hpa_file" ]]; then
+            hpa_json=$(cat "$hpa_file")
+        fi
 
         cat <<EOF
 {
@@ -99,7 +118,7 @@ openclaw_status_all() {
   "namespace": "${OPENCLAW_KUBECTL_NAMESPACE}",
   "nodes": ${nodes_json},
   "pods": ${pods_json},
-  "deployments": ${deployments_json},
+  "deployments": ${depls_json},
   "hpa": ${hpa_json}
 }
 EOF
@@ -124,8 +143,8 @@ openclaw_status_nodes() {
 
     openclaw_log_debug "Getting node status..."
 
-    local nodes_json
-    nodes_json=$(openclaw_api_get_nodes) || {
+    local json_file
+    json_file=$(openclaw_api_get_nodes_file) || {
         openclaw_log_error "Failed to get node list"
         return 1
     }
@@ -134,56 +153,91 @@ openclaw_status_nodes() {
     openclaw_trace_update_step "get_nodes" "success" "Node status retrieved"
 
     if [[ "$output_format" == "json" ]]; then
-        echo "$nodes_json"
+        cat "$json_file"
         return 0
     fi
 
-    local node_count
-    node_count=$(echo "$nodes_json" | python3 -c "
+    local count_script='
 import json, sys
-data = json.load(sys.stdin)
-print(len(data.get('items', [])))
-" 2>/dev/null || echo "0")
+
+input_path = sys.argv[1]
+output_path = sys.argv[2]
+
+try:
+    with open(input_path, "r") as f:
+        data = json.load(f)
+    count = len(data.get("items", []))
+except Exception:
+    count = 0
+
+with open(output_path, "w") as f:
+    f.write(str(count))
+'
+
+    local node_count
+    node_count=$(openclaw_process_json_script_file "$json_file" "$count_script" 30 || echo "0")
 
     echo "--- Nodes (${node_count}) ---"
 
-    local node_info
-    node_info=$(echo "$nodes_json" | python3 -c "
+    local info_script='
 import json, sys
-data = json.load(sys.stdin)
-items = data.get('items', [])
+from datetime import datetime, timezone
+
+input_path = sys.argv[1]
+output_path = sys.argv[2]
+
+lines = []
+
+try:
+    with open(input_path, "r") as f:
+        data = json.load(f)
+    items = data.get("items", [])
+except Exception as e:
+    with open(output_path, "w") as f:
+        f.write("")
+    sys.exit(0)
+
 for node in items:
-    name = node['metadata']['name']
+    try:
+        name = node.get("metadata", {}).get("name", "unknown")
 
-    status = node.get('status', {})
-    conditions = status.get('conditions', [])
-    ready_status = 'Unknown'
-    for cond in conditions:
-        if cond.get('type') == 'Ready':
-            if cond.get('status') == 'True':
-                ready_status = 'Ready'
-            else:
-                ready_status = 'NotReady'
-            break
+        status = node.get("status", {})
+        conditions = status.get("conditions", [])
+        ready_status = "Unknown"
+        for cond in conditions:
+            if cond.get("type") == "Ready":
+                if cond.get("status") == "True":
+                    ready_status = "Ready"
+                else:
+                    ready_status = "NotReady"
+                break
 
-    capacity = status.get('capacity', {})
-    cpu_cap = capacity.get('cpu', 'N/A')
-    mem_cap = capacity.get('memory', 'N/A')
+        capacity = status.get("capacity", {})
+        cpu_cap = capacity.get("cpu", "N/A")
+        mem_cap = capacity.get("memory", "N/A")
 
-    allocatable = status.get('allocatable', {})
-    cpu_alloc = allocatable.get('cpu', 'N/A')
-    mem_alloc = allocatable.get('memory', 'N/A')
+        allocatable = status.get("allocatable", {})
+        cpu_alloc = allocatable.get("cpu", "N/A")
+        mem_alloc = allocatable.get("memory", "N/A")
 
-    roles = []
-    labels = node.get('metadata', {}).get('labels', {})
-    for key in labels:
-        if key.startswith('node-role.kubernetes.io/'):
-            role = key.replace('node-role.kubernetes.io/', '')
-            roles.append(role)
-    role_str = ','.join(roles) if roles else '<none>'
+        roles = []
+        labels = node.get("metadata", {}).get("labels", {})
+        for key in labels:
+            if key.startswith("node-role.kubernetes.io/"):
+                role = key.replace("node-role.kubernetes.io/", "")
+                roles.append(role)
+        role_str = ",".join(roles) if roles else "<none>"
 
-    print(f'{name}|{ready_status}|{role_str}|{cpu_cap}|{mem_cap}')
-" 2>/dev/null)
+        lines.append(f"{name}|{ready_status}|{role_str}|{cpu_cap}|{mem_cap}")
+    except Exception:
+        continue
+
+with open(output_path, "w") as f:
+    f.write("\n".join(lines))
+'
+
+    local node_info
+    node_info=$(openclaw_process_json_script_file "$json_file" "$info_script" 60 || echo "")
 
     printf "%-25s %-12s %-15s %-10s %-15s\n" \
         "NAME" "STATUS" "ROLES" "CPU" "MEMORY"
@@ -191,7 +245,8 @@ for node in items:
         "---" "---" "---" "---" "---"
 
     if [[ -n "$node_info" ]]; then
-        while IFS='|' read -r name status roles cpu mem; do
+        while IFS='|' read -r name status roles cpu mem || [[ -n "$name" ]]; do
+            [[ -z "$name" ]] && continue
             printf "%-25s %-12s %-15s %-10s %-15s\n" \
                 "$name" "$status" "$roles" "$cpu" "$mem"
         done <<< "$node_info"
@@ -205,8 +260,8 @@ openclaw_status_pods() {
 
     openclaw_log_debug "Getting pod status..."
 
-    local pods_json
-    pods_json=$(openclaw_api_get_pods) || {
+    local json_file
+    json_file=$(openclaw_api_get_pods_file) || {
         openclaw_log_error "Failed to get pod list"
         return 1
     }
@@ -215,68 +270,102 @@ openclaw_status_pods() {
     openclaw_trace_update_step "get_pods" "success" "Pod status retrieved"
 
     if [[ "$output_format" == "json" ]]; then
-        echo "$pods_json"
+        cat "$json_file"
         return 0
     fi
 
-    local pod_count
-    pod_count=$(echo "$pods_json" | python3 -c "
+    local count_script='
 import json, sys
-data = json.load(sys.stdin)
-print(len(data.get('items', [])))
-" 2>/dev/null || echo "0")
+
+input_path = sys.argv[1]
+output_path = sys.argv[2]
+
+try:
+    with open(input_path, "r") as f:
+        data = json.load(f)
+    count = len(data.get("items", []))
+except Exception:
+    count = 0
+
+with open(output_path, "w") as f:
+    f.write(str(count))
+'
+
+    local pod_count
+    pod_count=$(openclaw_process_json_script_file "$json_file" "$count_script" 30 || echo "0")
 
     echo "--- Pods (${pod_count}) ---"
 
-    local pod_info
-    pod_info=$(echo "$pods_json" | python3 -c "
+    local info_script='
 import json, sys
-data = json.load(sys.stdin)
-items = data.get('items', [])
+from datetime import datetime, timezone
+
+input_path = sys.argv[1]
+output_path = sys.argv[2]
+
+lines = []
+
+try:
+    with open(input_path, "r") as f:
+        data = json.load(f)
+    items = data.get("items", [])
+except Exception as e:
+    with open(output_path, "w") as f:
+        f.write("")
+    sys.exit(0)
+
 for pod in items:
-    name = pod['metadata']['name']
-    status = pod.get('status', {})
-    phase = status.get('phase', 'Unknown')
+    try:
+        name = pod.get("metadata", {}).get("name", "unknown")
+        status = pod.get("status", {})
+        phase = status.get("phase", "Unknown")
 
-    restarts = 0
-    container_statuses = status.get('containerStatuses', [])
-    for cs in container_statuses:
-        restarts += cs.get('restartCount', 0)
+        restarts = 0
+        container_statuses = status.get("containerStatuses", [])
+        for cs in container_statuses:
+            restarts += cs.get("restartCount", 0)
 
-    spec = pod.get('spec', {})
-    node_name = spec.get('nodeName', '<none>')
+        spec = pod.get("spec", {})
+        node_name = spec.get("nodeName", "<none>")
 
-    ready = '0/0'
-    total_containers = len(spec.get('containers', []))
-    ready_containers = 0
-    for cs in container_statuses:
-        if cs.get('ready', False):
-            ready_containers += 1
-    if total_containers > 0:
-        ready = f'{ready_containers}/{total_containers}'
+        ready = "0/0"
+        total_containers = len(spec.get("containers", []))
+        ready_containers = 0
+        for cs in container_statuses:
+            if cs.get("ready", False):
+                ready_containers += 1
+        if total_containers > 0:
+            ready = f"{ready_containers}/{total_containers}"
 
-    age = 'N/A'
-    creation_ts = pod.get('metadata', {}).get('creationTimestamp')
-    if creation_ts:
-        from datetime import datetime, timezone
-        try:
-            created = datetime.fromisoformat(creation_ts.replace('Z', '+00:00'))
-            now = datetime.now(timezone.utc)
-            delta = now - created
-            total_secs = int(delta.total_seconds())
-            if total_secs < 60:
-                age = f'{total_secs}s'
-            elif total_secs < 3600:
-                age = f'{total_secs // 60}m'
-            elif total_secs < 86400:
-                age = f'{total_secs // 3600}h'
-            else:
-                age = f'{total_secs // 86400}d'
-        except:
-            pass
+        age = "N/A"
+        creation_ts = pod.get("metadata", {}).get("creationTimestamp")
+        if creation_ts:
+            try:
+                created = datetime.fromisoformat(creation_ts.replace("Z", "+00:00"))
+                now = datetime.now(timezone.utc)
+                delta = now - created
+                total_secs = int(delta.total_seconds())
+                if total_secs < 60:
+                    age = f"{total_secs}s"
+                elif total_secs < 3600:
+                    age = f"{total_secs // 60}m"
+                elif total_secs < 86400:
+                    age = f"{total_secs // 3600}h"
+                else:
+                    age = f"{total_secs // 86400}d"
+            except Exception:
+                pass
 
-    print(f'{name}|{ready}|{phase}|{restarts}|{age}|{node_name}')
-" 2>/dev/null)
+        lines.append(f"{name}|{ready}|{phase}|{restarts}|{age}|{node_name}")
+    except Exception:
+        continue
+
+with open(output_path, "w") as f:
+    f.write("\n".join(lines))
+'
+
+    local pod_info
+    pod_info=$(openclaw_process_json_script_file "$json_file" "$info_script" 120 || echo "")
 
     printf "%-35s %-10s %-12s %-10s %-10s %-20s\n" \
         "NAME" "READY" "STATUS" "RESTARTS" "AGE" "NODE"
@@ -284,7 +373,8 @@ for pod in items:
         "---" "---" "---" "---" "---" "---"
 
     if [[ -n "$pod_info" ]]; then
-        while IFS='|' read -r name ready status restarts age node; do
+        while IFS='|' read -r name ready status restarts age node || [[ -n "$name" ]]; do
+            [[ -z "$name" ]] && continue
             printf "%-35s %-10s %-12s %-10s %-10s %-20s\n" \
                 "$name" "$ready" "$status" "$restarts" "$age" "$node"
         done <<< "$pod_info"
@@ -298,8 +388,8 @@ openclaw_status_deployments() {
 
     openclaw_log_debug "Getting deployment status..."
 
-    local depl_json
-    depl_json=$(openclaw_api_get_deployments) || {
+    local json_file
+    json_file=$(openclaw_api_get_deployments_file) || {
         openclaw_log_error "Failed to get deployment list"
         return 1
     }
@@ -308,56 +398,90 @@ openclaw_status_deployments() {
     openclaw_trace_update_step "get_deployments" "success" "Deployment status retrieved"
 
     if [[ "$output_format" == "json" ]]; then
-        echo "$depl_json"
+        cat "$json_file"
         return 0
     fi
 
-    local depl_count
-    depl_count=$(echo "$depl_json" | python3 -c "
+    local count_script='
 import json, sys
-data = json.load(sys.stdin)
-print(len(data.get('items', [])))
-" 2>/dev/null || echo "0")
+
+input_path = sys.argv[1]
+output_path = sys.argv[2]
+
+try:
+    with open(input_path, "r") as f:
+        data = json.load(f)
+    count = len(data.get("items", []))
+except Exception:
+    count = 0
+
+with open(output_path, "w") as f:
+    f.write(str(count))
+'
+
+    local depl_count
+    depl_count=$(openclaw_process_json_script_file "$json_file" "$count_script" 30 || echo "0")
 
     echo "--- Deployments (${depl_count}) ---"
 
-    local depl_info
-    depl_info=$(echo "$depl_json" | python3 -c "
+    local info_script='
 import json, sys
-data = json.load(sys.stdin)
-items = data.get('items', [])
+from datetime import datetime, timezone
+
+input_path = sys.argv[1]
+output_path = sys.argv[2]
+
+lines = []
+
+try:
+    with open(input_path, "r") as f:
+        data = json.load(f)
+    items = data.get("items", [])
+except Exception as e:
+    with open(output_path, "w") as f:
+        f.write("")
+    sys.exit(0)
+
 for depl in items:
-    name = depl['metadata']['name']
-    spec = depl.get('spec', {})
-    desired = spec.get('replicas', 0)
+    try:
+        name = depl.get("metadata", {}).get("name", "unknown")
+        spec = depl.get("spec", {})
+        desired = spec.get("replicas", 0)
 
-    status = depl.get('status', {})
-    ready = status.get('readyReplicas', 0)
-    updated = status.get('updatedReplicas', 0)
-    available = status.get('availableReplicas', 0)
+        status = depl.get("status", {})
+        ready = status.get("readyReplicas", 0)
+        updated = status.get("updatedReplicas", 0)
+        available = status.get("availableReplicas", 0)
 
-    age = 'N/A'
-    creation_ts = depl.get('metadata', {}).get('creationTimestamp')
-    if creation_ts:
-        from datetime import datetime, timezone
-        try:
-            created = datetime.fromisoformat(creation_ts.replace('Z', '+00:00'))
-            now = datetime.now(timezone.utc)
-            delta = now - created
-            total_secs = int(delta.total_seconds())
-            if total_secs < 60:
-                age = f'{total_secs}s'
-            elif total_secs < 3600:
-                age = f'{total_secs // 60}m'
-            elif total_secs < 86400:
-                age = f'{total_secs // 3600}h'
-            else:
-                age = f'{total_secs // 86400}d'
-        except:
-            pass
+        age = "N/A"
+        creation_ts = depl.get("metadata", {}).get("creationTimestamp")
+        if creation_ts:
+            try:
+                created = datetime.fromisoformat(creation_ts.replace("Z", "+00:00"))
+                now = datetime.now(timezone.utc)
+                delta = now - created
+                total_secs = int(delta.total_seconds())
+                if total_secs < 60:
+                    age = f"{total_secs}s"
+                elif total_secs < 3600:
+                    age = f"{total_secs // 60}m"
+                elif total_secs < 86400:
+                    age = f"{total_secs // 3600}h"
+                else:
+                    age = f"{total_secs // 86400}d"
+            except Exception:
+                pass
 
-    print(f'{name}|{ready}/{desired}|{updated}|{available}|{age}')
-" 2>/dev/null)
+        lines.append(f"{name}|{ready}/{desired}|{updated}|{available}|{age}")
+    except Exception:
+        continue
+
+with open(output_path, "w") as f:
+    f.write("\n".join(lines))
+'
+
+    local depl_info
+    depl_info=$(openclaw_process_json_script_file "$json_file" "$info_script" 60 || echo "")
 
     printf "%-30s %-12s %-10s %-12s %-10s\n" \
         "NAME" "READY" "UP-TO-DATE" "AVAILABLE" "AGE"
@@ -365,7 +489,8 @@ for depl in items:
         "---" "---" "---" "---" "---"
 
     if [[ -n "$depl_info" ]]; then
-        while IFS='|' read -r name ready updated available age; do
+        while IFS='|' read -r name ready updated available age || [[ -n "$name" ]]; do
+            [[ -z "$name" ]] && continue
             printf "%-30s %-12s %-10s %-12s %-10s\n" \
                 "$name" "$ready" "$updated" "$available" "$age"
         done <<< "$depl_info"
@@ -394,8 +519,12 @@ openclaw_status_watch() {
     while true; do
         clear 2>/dev/null || printf "\033c"
         openclaw_status_show "$resource_type" "$output_format"
+        local show_exit=$?
         echo ""
         echo "--- Refreshing every ${interval}s (Ctrl+C to exit) ---"
+
+        openclaw_reap_zombies
+
         sleep "$interval"
     done
 }

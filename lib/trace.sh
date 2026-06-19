@@ -310,30 +310,62 @@ openclaw_trace_save() {
         }
     fi
 
-    local trace_json
-    trace_json=$(openclaw_trace_build_json)
+    local raw_json_file
+    raw_json_file=$(openclaw_tmpfile_create "trace_raw") || return 1
+
+    openclaw_trace_build_json > "$raw_json_file" 2>/dev/null
 
     if command -v python3 &>/dev/null; then
-        local formatted_json
-        formatted_json=$(echo "$trace_json" | python3 -m json.tool 2>/dev/null || echo "$trace_json")
-        echo "$formatted_json" > "$OPENCLAW_TRACE_RECORD_FILE"
+        local format_script='
+import json, sys
+
+input_path = sys.argv[1]
+output_path = sys.argv[2]
+
+try:
+    with open(input_path, "r") as f:
+        data = json.load(f)
+    with open(output_path, "w") as f:
+        json.dump(data, f, indent=2)
+except Exception:
+    import shutil
+    shutil.copyfile(input_path, output_path)
+'
+        if openclaw_process_json_script_file "$raw_json_file" "$format_script" 30 > /dev/null 2>&1; then
+            local out_file
+            out_file=$(openclaw_tmpfile_create "trace_fmt")
+            openclaw_process_json_script_file "$raw_json_file" "$format_script" 30 > "$out_file" 2>/dev/null || true
+            if [[ -s "$out_file" ]]; then
+                cat "$out_file" > "$OPENCLAW_TRACE_RECORD_FILE"
+            else
+                cat "$raw_json_file" > "$OPENCLAW_TRACE_RECORD_FILE"
+            fi
+        else
+            cat "$raw_json_file" > "$OPENCLAW_TRACE_RECORD_FILE"
+        fi
     else
-        echo "$trace_json" > "$OPENCLAW_TRACE_RECORD_FILE"
+        cat "$raw_json_file" > "$OPENCLAW_TRACE_RECORD_FILE"
     fi
 
     openclaw_log_debug "Trace saved to: ${OPENCLAW_TRACE_RECORD_FILE}"
 
     if command -v python3 &>/dev/null && [[ -f "${OPENCLAW_MODELS_DIR}/execution_trace.py" ]]; then
-        openclaw_trace_save_with_python "$trace_json" || true
+        openclaw_trace_save_with_python "$raw_json_file" || true
     fi
 }
 
 openclaw_trace_save_with_python() {
-    local json_data="$1"
-    python3 "${OPENCLAW_MODELS_DIR}/execution_trace.py" \
+    local json_input_file="$1"
+
+    if [[ ! -f "$json_input_file" ]]; then
+        openclaw_log_debug "Trace JSON file not found for Python save"
+        return 1
+    fi
+
+    openclaw_exec_with_timeout 60 python3 "${OPENCLAW_MODELS_DIR}/execution_trace.py" \
         --trace-id "$OPENCLAW_TRACE_ID" \
         --output-dir "$OPENCLAW_TRACE_RECORD_DIR" \
-        --json "$json_data" 2>/dev/null || true
+        --input "$json_input_file" 2>/dev/null || true
 }
 
 openclaw_trace_get() {
@@ -365,24 +397,59 @@ openclaw_trace_find_record() {
         return 1
     fi
 
-    find "$OPENCLAW_RECORDS_DIR" -name "trace_${trace_id}.json" -type f 2>/dev/null | head -1
+    if [[ ! -d "$OPENCLAW_RECORDS_DIR" ]]; then
+        return 1
+    fi
+
+    local result_file
+    result_file=$(openclaw_tmpfile_create "findres") || return 1
+
+    openclaw_exec_with_timeout 30 find "$OPENCLAW_RECORDS_DIR" -name "trace_${trace_id}.json" -type f \
+        >"$result_file" 2>/dev/null || true
+
+    local first_line
+    first_line=$(head -n 1 "$result_file" 2>/dev/null || true)
+
+    if [[ -n "$first_line" ]]; then
+        echo "$first_line"
+        return 0
+    fi
+    return 1
 }
 
 openclaw_trace_list_records() {
     local limit="${1:-20}"
     local since="${2:-}"
 
-    local find_cmd="find \"$OPENCLAW_RECORDS_DIR\" -name 'trace_*.json' -type f"
+    if [[ ! -d "$OPENCLAW_RECORDS_DIR" ]]; then
+        return 0
+    fi
+
+    local find_out_file
+    find_out_file=$(openclaw_tmpfile_create "findlist") || return 0
+    local sort_out_file
+    sort_out_file=$(openclaw_tmpfile_create "sortlist") || return 0
+
+    local -a find_args=("$OPENCLAW_RECORDS_DIR" -name "trace_*.json" -type f)
 
     if [[ -n "$since" ]]; then
         local since_date
         since_date=$(date -d "$since" +%Y-%m-%d 2>/dev/null || echo "$since")
-        find_cmd="$find_cmd -newermt \"$since_date\""
+        find_args+=("-newermt" "$since_date")
     fi
 
-    find_cmd="$find_cmd -printf '%T@ %p\n' | sort -rn | head -n $limit"
+    find_args+=("-printf" "%T@ %p\n")
 
-    eval "$find_cmd" 2>/dev/null || true
+    if ! openclaw_exec_with_timeout 60 find "${find_args[@]}" >"$find_out_file" 2>/dev/null; then
+        openclaw_log_debug "find command timed out or failed"
+    fi
+
+    if [[ -s "$find_out_file" ]]; then
+        sort -rn "$find_out_file" > "$sort_out_file" 2>/dev/null || true
+        head -n "$limit" "$sort_out_file" 2>/dev/null || true
+    fi
+
+    return 0
 }
 
 openclaw_trace_cleanup_old() {
@@ -394,12 +461,25 @@ openclaw_trace_cleanup_old() {
         return 0
     fi
 
-    local deleted_count
-    deleted_count=$(find "$OPENCLAW_RECORDS_DIR" -name "trace_*.json" -type f -mtime "+${days}" -delete -print 2>/dev/null | wc -l)
+    local list_file
+    list_file=$(openclaw_tmpfile_create "cleanlist") || return 0
+
+    openclaw_exec_with_timeout 120 find "$OPENCLAW_RECORDS_DIR" -name "trace_*.json" -type f -mtime "+${days}" \
+        >"$list_file" 2>/dev/null || true
+
+    local deleted_count=0
+    if [[ -s "$list_file" ]]; then
+        while IFS= read -r filepath || [[ -n "$filepath" ]]; do
+            [[ -z "$filepath" ]] && continue
+            if rm -f "$filepath" 2>/dev/null; then
+                deleted_count=$((deleted_count + 1))
+            fi
+        done < "$list_file"
+    fi
 
     openclaw_log_info "Cleaned up ${deleted_count} old trace records"
 
-    find "$OPENCLAW_RECORDS_DIR" -type d -empty -delete 2>/dev/null || true
+    openclaw_exec_with_timeout 30 find "$OPENCLAW_RECORDS_DIR" -type d -empty -delete 2>/dev/null || true
 
     return 0
 }
@@ -466,10 +546,11 @@ openclaw_audit_list() {
 
     openclaw_log_info "Listing recent audit records (limit: ${limit})"
 
-    local records
-    records=$(openclaw_trace_list_records "$limit")
+    local list_file
+    list_file=$(openclaw_tmpfile_create "auditlist") || return 0
+    openclaw_trace_list_records "$limit" > "$list_file" 2>/dev/null || true
 
-    if [[ -z "$records" ]]; then
+    if [[ ! -s "$list_file" ]]; then
         openclaw_log_info "No audit records found"
         return 0
     fi
@@ -477,9 +558,9 @@ openclaw_audit_list() {
     if [[ "$format" == "json" ]]; then
         echo "["
         local first=true
-        while IFS= read -r line; do
-            local filepath
-            filepath=$(echo "$line" | awk '{print $2}')
+        local filepath
+        while IFS= read -r _ filepath || [[ -n "$filepath" ]]; do
+            [[ -z "$filepath" ]] && continue
             if [[ -f "$filepath" ]]; then
                 if $first; then
                     first=false
@@ -488,27 +569,61 @@ openclaw_audit_list() {
                 fi
                 cat "$filepath"
             fi
-        done <<< "$records"
+        done < "$list_file"
         echo "]"
     else
+        local summary_script='
+import json, sys
+
+list_path = sys.argv[1]
+output_path = sys.argv[2]
+
+lines = []
+
+try:
+    with open(list_path, "r") as f:
+        for raw_line in f:
+            raw_line = raw_line.rstrip("\n")
+            if not raw_line:
+                continue
+            parts = raw_line.split(None, 1)
+            if len(parts) < 2:
+                continue
+            filepath = parts[1]
+            try:
+                with open(filepath, "r") as jf:
+                    data = json.load(jf)
+                tid = data.get("trace_id", "?")
+                cmd = data.get("command", "?")
+                status = data.get("status", "?")
+                ctx = data.get("context", {})
+                ns = ctx.get("namespace", "default")
+                start_time = data.get("start_time", "?")
+                if len(start_time) >= 19:
+                    start_time = start_time[11:19]
+                lines.append(f"{tid}|{cmd}|{start_time}|{status}|{ns}")
+            except Exception:
+                continue
+except Exception:
+    pass
+
+with open(output_path, "w") as f:
+    f.write("\n".join(lines))
+'
+        local summary_file
+        summary_file=$(openclaw_tmpfile_create "auditsum")
+        openclaw_process_json_script_file "$list_file" "$summary_script" 60 > "$summary_file" 2>/dev/null || true
+
         printf "%-25s %-15s %-20s %-10s %s\n" "TRACE_ID" "COMMAND" "TIME" "STATUS" "NAMESPACE"
         printf "%-25s %-15s %-20s %-10s %s\n" "---" "---" "---" "---" "---"
 
-        while IFS= read -r line; do
-            local filepath
-            filepath=$(echo "$line" | awk '{print $2}')
-            if [[ -f "$filepath" ]]; then
-                local tid cmd status ns time
-                tid=$(openclaw_extract_json_field "$(cat "$filepath")" ".trace_id" 2>/dev/null || echo "?")
-                cmd=$(openclaw_extract_json_field "$(cat "$filepath")" ".command" 2>/dev/null || echo "?")
-                status=$(openclaw_extract_json_field "$(cat "$filepath")" ".status" 2>/dev/null || echo "?")
-                ns=$(openclaw_extract_json_field "$(cat "$filepath")" '.context["namespace"]' 2>/dev/null || echo "default")
-                time=$(openclaw_extract_json_field "$(cat "$filepath")" ".start_time" 2>/dev/null || echo "?")
-                time=${time:11:8}
-
+        if [[ -s "$summary_file" ]]; then
+            local tid cmd time status ns
+            while IFS='|' read -r tid cmd time status ns || [[ -n "$tid" ]]; do
+                [[ -z "$tid" ]] && continue
                 printf "%-25s %-15s %-20s %-10s %s\n" "$tid" "$cmd" "$time" "$status" "$ns"
-            fi
-        done <<< "$records"
+            done < "$summary_file"
+        fi
     fi
 }
 

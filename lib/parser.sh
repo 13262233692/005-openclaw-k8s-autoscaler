@@ -165,9 +165,26 @@ openclaw_print_main_help() {
     echo "      --version              Display version information"
     echo ""
     echo "Available Commands:"
-    for cmd in $(echo "${!OPENCLAW_COMMANDS[@]}" | tr ' ' '\n' | sort); do
-        printf "  %-20s %s\n" "$cmd" "${OPENCLAW_COMMAND_DESCRIPTIONS[$cmd]}"
+    local -a cmd_list=()
+    local c
+    for c in "${!OPENCLAW_COMMANDS[@]}"; do
+        cmd_list+=("$c")
     done
+    if [[ ${#cmd_list[@]} -gt 0 ]]; then
+        local cmd_file
+        cmd_file=$(openclaw_tmpfile_create "cmdsort") || true
+        if [[ -n "$cmd_file" ]]; then
+            printf '%s\n' "${cmd_list[@]}" | sort > "$cmd_file" 2>/dev/null || printf '%s\n' "${cmd_list[@]}" > "$cmd_file"
+            while IFS= read -r cmd || [[ -n "$cmd" ]]; do
+                [[ -z "$cmd" ]] && continue
+                printf "  %-20s %s\n" "$cmd" "${OPENCLAW_COMMAND_DESCRIPTIONS[$cmd]}"
+            done < "$cmd_file"
+        else
+            for cmd in "${cmd_list[@]}"; do
+                printf "  %-20s %s\n" "$cmd" "${OPENCLAW_COMMAND_DESCRIPTIONS[$cmd]}"
+            done
+        fi
+    fi
     echo ""
     echo "Use 'openclaw help <command>' for detailed help on a specific command."
 }

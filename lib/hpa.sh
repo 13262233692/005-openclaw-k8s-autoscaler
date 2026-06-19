@@ -70,24 +70,31 @@ openclaw_hpa_list() {
 
     openclaw_log_info "Listing HPA configurations in namespace: ${OPENCLAW_KUBECTL_NAMESPACE}"
 
-    local hpa_json
-    hpa_json=$(openclaw_api_get_hpa_list) || {
+    local hpa_file
+    hpa_file=$(openclaw_api_get_hpa_list_file) || {
         openclaw_log_error "Failed to get HPA list"
         return 1
     }
 
-    openclaw_trace_set_context "hpa_count" "$(echo "$hpa_json" | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('items',[])))" 2>/dev/null || echo "0")"
+    local count_script='
+import json, sys
+data = json.load(open(sys.argv[1]))
+print(len(data.get("items", [])))
+'
+    local hpa_count
+    hpa_count=$(openclaw_process_json_script_file "$hpa_file" "$count_script" 30 2>/dev/null || echo "0")
+    openclaw_trace_set_context "hpa_count" "$hpa_count"
 
     case "$output_format" in
         json)
-            echo "$hpa_json"
+            cat "$hpa_file"
             ;;
         table)
-            openclaw_hpa_print_table "$hpa_json"
+            openclaw_hpa_print_table_file "$hpa_file"
             ;;
         yaml)
             openclaw_log_warn "YAML output not implemented, using JSON"
-            echo "$hpa_json"
+            cat "$hpa_file"
             ;;
         *)
             openclaw_log_error "Unknown output format: ${output_format}"
@@ -100,51 +107,55 @@ openclaw_hpa_list() {
     return 0
 }
 
-openclaw_hpa_print_table() {
-    local hpa_json="$1"
+openclaw_hpa_print_table_file() {
+    local hpa_file="$1"
 
-    local items
-    items=$(echo "$hpa_json" | python3 -c "
+    local table_script='
 import json, sys
-data = json.load(sys.stdin)
-items = data.get('items', [])
+data = json.load(open(sys.argv[1]))
+items = data.get("items", [])
 for item in items:
-    name = item['metadata']['name']
-    spec = item.get('spec', {})
-    min_r = spec.get('minReplicas', 'N/A')
-    max_r = spec.get('maxReplicas', 'N/A')
+    name = item["metadata"]["name"]
+    spec = item.get("spec", {})
+    min_r = spec.get("minReplicas", "N/A")
+    max_r = spec.get("maxReplicas", "N/A")
 
-    cpu_target = 'N/A'
-    mem_target = 'N/A'
-    for m in spec.get('metrics', []):
-        if m.get('type') == 'Resource':
-            res = m.get('resource', {})
-            rname = res.get('name', '')
-            target = res.get('target', {})
-            if target.get('type') == 'Utilization':
-                val = target.get('averageUtilization', 'N/A')
-                if rname == 'cpu':
-                    cpu_target = str(val) + '%'
-                elif rname == 'memory':
-                    mem_target = str(val) + '%'
+    cpu_target = "N/A"
+    mem_target = "N/A"
+    for m in spec.get("metrics", []):
+        if m.get("type") == "Resource":
+            res = m.get("resource", {})
+            rname = res.get("name", "")
+            target = res.get("target", {})
+            if target.get("type") == "Utilization":
+                val = target.get("averageUtilization", "N/A")
+                if rname == "cpu":
+                    cpu_target = str(val) + "%"
+                elif rname == "memory":
+                    mem_target = str(val) + "%"
 
-    status = item.get('status', {})
-    cur_replicas = status.get('currentReplicas', 'N/A')
-    desired_replicas = status.get('desiredReplicas', 'N/A')
+    status = item.get("status", {})
+    cur_replicas = status.get("currentReplicas", "N/A")
+    desired_replicas = status.get("desiredReplicas", "N/A")
 
-    print(f'{name}|{min_r}|{max_r}|{cpu_target}|{mem_target}|{cur_replicas}|{desired_replicas}')
-" 2>/dev/null)
+    print(f"{name}|{min_r}|{max_r}|{cpu_target}|{mem_target}|{cur_replicas}|{desired_replicas}")
+'
+    local items_file
+    items_file=$(openclaw_tmpfile_create "hpatbl") || return 0
+    openclaw_process_json_script_file "$hpa_file" "$table_script" 60 > "$items_file" 2>/dev/null || true
 
     printf "%-25s %-8s %-8s %-10s %-10s %-10s %-10s\n" \
         "NAME" "MIN" "MAX" "CPU%" "MEM%" "CURRENT" "DESIRED"
     printf "%-25s %-8s %-8s %-10s %-10s %-10s %-10s\n" \
         "---" "---" "---" "---" "---" "---" "---"
 
-    if [[ -n "$items" ]]; then
-        while IFS='|' read -r name min_r max_r cpu_target mem_target cur desired; do
+    if [[ -s "$items_file" ]]; then
+        local name min_r max_r cpu_target mem_target cur desired
+        while IFS='|' read -r name min_r max_r cpu_target mem_target cur desired || [[ -n "$name" ]]; do
+            [[ -z "$name" ]] && continue
             printf "%-25s %-8s %-8s %-10s %-10s %-10s %-10s\n" \
                 "$name" "$min_r" "$max_r" "$cpu_target" "$mem_target" "$cur" "$desired"
-        done <<< "$items"
+        done < "$items_file"
     fi
 }
 
@@ -188,8 +199,8 @@ openclaw_hpa_get() {
 
     openclaw_trace_add_step "get_hpa" "get_hpa_detail" "Retrieving HPA details"
 
-    local hpa_json
-    hpa_json=$(openclaw_api_get_hpa "$hpa_name") || {
+    local hpa_file
+    hpa_file=$(openclaw_kubectl_get_json_file "hpa" "$hpa_name") || {
         openclaw_trace_update_step "get_hpa" "failed" "HPA not found"
         openclaw_log_error "Failed to get HPA: ${hpa_name}"
         return 1
@@ -199,10 +210,10 @@ openclaw_hpa_get() {
 
     case "$output_format" in
         json)
-            echo "$hpa_json"
+            cat "$hpa_file"
             ;;
         table|text)
-            openclaw_hpa_print_detail "$hpa_json"
+            openclaw_hpa_print_detail_file "$hpa_file"
             ;;
         *)
             openclaw_log_error "Unknown output format: ${output_format}"
@@ -215,26 +226,26 @@ openclaw_hpa_get() {
     return 0
 }
 
-openclaw_hpa_print_detail() {
-    local hpa_json="$1"
+openclaw_hpa_print_detail_file() {
+    local hpa_file="$1"
 
     local name
-    name=$(openclaw_extract_json_field "$hpa_json" ".metadata.name")
+    name=$(openclaw_extract_json_field_file "$hpa_file" ".metadata.name")
     local namespace
-    namespace=$(openclaw_extract_json_field "$hpa_json" ".metadata.namespace")
+    namespace=$(openclaw_extract_json_field_file "$hpa_file" ".metadata.namespace")
     local min_replicas
-    min_replicas=$(openclaw_extract_json_field "$hpa_json" ".spec.minReplicas")
+    min_replicas=$(openclaw_extract_json_field_file "$hpa_file" ".spec.minReplicas")
     local max_replicas
-    max_replicas=$(openclaw_extract_json_field "$hpa_json" ".spec.maxReplicas")
+    max_replicas=$(openclaw_extract_json_field_file "$hpa_file" ".spec.maxReplicas")
     local scale_target
-    scale_target=$(openclaw_extract_json_field "$hpa_json" ".spec.scaleTargetRef.name")
+    scale_target=$(openclaw_extract_json_field_file "$hpa_file" ".spec.scaleTargetRef.name")
     local scale_target_kind
-    scale_target_kind=$(openclaw_extract_json_field "$hpa_json" ".spec.scaleTargetRef.kind")
+    scale_target_kind=$(openclaw_extract_json_field_file "$hpa_file" ".spec.scaleTargetRef.kind")
 
     local current_replicas
-    current_replicas=$(openclaw_extract_json_field "$hpa_json" ".status.currentReplicas")
+    current_replicas=$(openclaw_extract_json_field_file "$hpa_file" ".status.currentReplicas")
     local desired_replicas
-    desired_replicas=$(openclaw_extract_json_field "$hpa_json" ".status.desiredReplicas")
+    desired_replicas=$(openclaw_extract_json_field_file "$hpa_file" ".status.desiredReplicas")
 
     echo ""
     echo "=== HPA: ${name} ==="
@@ -247,58 +258,55 @@ openclaw_hpa_print_detail() {
     echo ""
     echo "--- Thresholds ---"
 
-    local metrics_count
-    metrics_count=$(echo "$hpa_json" | python3 -c "
+    local detail_script='
 import json, sys
-data = json.load(sys.stdin)
-metrics = data.get('spec', {}).get('metrics', [])
-print(len(metrics))
-" 2>/dev/null || echo "0")
-
-    if [[ "$metrics_count" -gt 0 ]]; then
-        echo "$hpa_json" | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-metrics = data.get('spec', {}).get('metrics', [])
+data = json.load(open(sys.argv[1]))
+metrics = data.get("spec", {}).get("metrics", [])
 for m in metrics:
-    if m.get('type') == 'Resource':
-        res = m.get('resource', {})
-        rname = res.get('name', '')
-        target = res.get('target', {})
-        if target.get('type') == 'Utilization':
-            val = target.get('averageUtilization', 'N/A')
-            print(f'  {rname.upper()} Target:    {val}%')
-"
+    if m.get("type") == "Resource":
+        res = m.get("resource", {})
+        rname = res.get("name", "")
+        target = res.get("target", {})
+        if target.get("type") == "Utilization":
+            val = target.get("averageUtilization", "N/A")
+            print(f"  {rname.upper()} Target:    {val}%")
+'
+    local out_file
+    out_file=$(openclaw_tmpfile_create "hpadetail")
+    if openclaw_process_json_script_file "$hpa_file" "$detail_script" 30 > "$out_file" 2>/dev/null && [[ -s "$out_file" ]]; then
+        cat "$out_file"
     fi
 
     echo ""
     echo "--- Current Metrics ---"
 
-    local current_metrics
-    current_metrics=$(echo "$hpa_json" | python3 -c "
+    local curr_script='
 import json, sys
-data = json.load(sys.stdin)
-metrics = data.get('status', {}).get('currentMetrics', [])
-print(len(metrics))
-" 2>/dev/null || echo "0")
-
-    if [[ "$current_metrics" -gt 0 ]]; then
-        echo "$hpa_json" | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-metrics = data.get('status', {}).get('currentMetrics', [])
-for m in metrics:
-    if m.get('type') == 'Resource':
-        res = m.get('resource', {})
-        rname = res.get('name', '')
-        val = res.get('current', {})
-        avg_util = val.get('averageUtilization', 'N/A')
-        avg_val = val.get('averageValue', 'N/A')
-        if avg_util != 'N/A':
-            print(f'  {rname.upper()} Current:   {avg_util}%')
-        else:
-            print(f'  {rname.upper()} Current:   {avg_val}')
-"
+data = json.load(open(sys.argv[1]))
+metrics = data.get("status", {}).get("currentMetrics", [])
+if not metrics:
+    print("  (no current metrics available)")
+else:
+    for m in metrics:
+        if m.get("type") == "Resource":
+            res = m.get("resource", {})
+            rname = res.get("name", "")
+            val = res.get("current", {})
+            avg_util = val.get("averageUtilization", "N/A")
+            avg_val = val.get("averageValue", "N/A")
+            if avg_util != "N/A":
+                print(f"  {rname.upper()} Current:   {avg_util}%")
+            else:
+                print(f"  {rname.upper()} Current:   {avg_val}")
+'
+    local curr_out_file
+    curr_out_file=$(openclaw_tmpfile_create "hpacurr")
+    if openclaw_process_json_script_file "$hpa_file" "$curr_script" 30 > "$curr_out_file" 2>/dev/null; then
+        if [[ -s "$curr_out_file" ]]; then
+            cat "$curr_out_file"
+        else
+            echo "  (no current metrics available)"
+        fi
     else
         echo "  (no current metrics available)"
     fi

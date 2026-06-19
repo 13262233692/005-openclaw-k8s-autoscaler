@@ -272,7 +272,7 @@ class TraceManager:
         if not path or not os.path.isfile(path):
             return None
         try:
-            with open(path, 'r', encoding='utf-8') as f:
+            with open(path, 'r', encoding='utf-8-sig') as f:
                 data = json.load(f)
             return ExecutionTrace.from_dict(data)
         except (json.JSONDecodeError, IOError):
@@ -314,7 +314,7 @@ class TraceManager:
 
         for _, filepath in all_files[:limit]:
             try:
-                with open(filepath, 'r', encoding='utf-8') as f:
+                with open(filepath, 'r', encoding='utf-8-sig') as f:
                     data = json.load(f)
                 traces.append(ExecutionTrace.from_dict(data))
             except (json.JSONDecodeError, IOError):
@@ -427,7 +427,7 @@ def main():
         if not os.path.isfile(args.input):
             print(f"Input file not found: {args.input}", file=sys.stderr)
             return 1
-        with open(args.input, 'r', encoding='utf-8') as f:
+        with open(args.input, 'r', encoding='utf-8-sig') as f:
             json_data = f.read()
         process_trace_from_json(json_data, args.output_dir)
         return 0
