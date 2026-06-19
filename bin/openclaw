@@ -1,0 +1,74 @@
+#!/bin/bash
+
+# Open Claw - Main Entry Point
+# Kubernetes test environment automation CLI tool
+# Version: 1.0.0
+
+set -o pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OPENCLAW_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+export OPENCLAW_ROOT
+
+if [[ ! -f "${OPENCLAW_ROOT}/config/config.sh" ]]; then
+    echo "ERROR: Configuration file not found: ${OPENCLAW_ROOT}/config/config.sh" >&2
+    exit 1
+fi
+
+source "${OPENCLAW_ROOT}/config/config.sh"
+
+OPENCLAW_LIB_DIR="${OPENCLAW_ROOT}/lib"
+
+_load_module() {
+    local module="$1"
+    local module_path="${OPENCLAW_LIB_DIR}/${module}.sh"
+
+    if [[ ! -f "$module_path" ]]; then
+        echo "ERROR: Module not found: ${module_path}" >&2
+        return 1
+    fi
+
+    source "$module_path"
+    return $?
+}
+
+openclaw_init() {
+    _load_module "utils" || return 1
+    _load_module "trace" || return 1
+    _load_module "webhook" || return 1
+    _load_module "api" || return 1
+    _load_module "parser" || return 1
+    _load_module "status" || return 1
+    _load_module "restart" || return 1
+    _load_module "hpa" || return 1
+
+    openclaw_parser_init
+
+    return 0
+}
+
+openclaw_main() {
+    openclaw_init || {
+        echo "ERROR: Failed to initialize Open Claw" >&2
+        exit 1
+    }
+
+    if ! openclaw_parse_global_options "$@"; then
+        exit 1
+    fi
+
+    if [[ -z "$OPENCLAW_COMMAND" ]]; then
+        openclaw_cmd_help
+        exit 0
+    fi
+
+    openclaw_dispatch_command "$OPENCLAW_COMMAND" "${OPENCLAW_COMMAND_ARGS[@]}"
+    local exit_code=$?
+
+    exit $exit_code
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    openclaw_main "$@"
+fi
